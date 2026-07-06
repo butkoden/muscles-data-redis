@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muscles-data-redis"
+version = "0.1.0"
+description = "Redis KeyValuePort, LockPort and StreamPort adapter for muscles-data"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Denis B.", email = "denis@butko.info" }]
+dependencies = [
+  "muscles-data>=0.1.0",
+  "redis>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
