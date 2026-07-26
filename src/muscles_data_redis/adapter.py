@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import threading
 import time
 import uuid
@@ -10,19 +11,21 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from muscles_data.config import DataResourceConfig
-from muscles_data.errors import DataError
+from muscles_data.errors import DataConfigurationError, DataConnectionError, DataError
 from muscles_data.models import DataCapability, HealthResult, InspectResult, LockHandle, StreamReadResult, WriteResult
 
 
 _CLIENT_UNSET = object()
 _ALLOWED_OPTIONS = {
     "url",
+    "url_env",
     "namespace",
     "decode_responses",
     "timeout",
     "socket_timeout",
     "socket_connect_timeout",
     "stream_group",
+    "consumer",
     "native_client",
 }
 _LOCK_RELEASE_SCRIPT = """
@@ -39,15 +42,15 @@ class RedisAdapterError(DataError):
     """Base error for Redis data adapter failures."""
 
 
-class RedisConfigError(ValueError, RedisAdapterError):
+class RedisConfigError(ValueError, DataConfigurationError, RedisAdapterError):
     """Raised when a Redis resource config cannot be mapped safely."""
 
 
-class RedisClientMissingError(RedisAdapterError):
+class RedisClientMissingError(DataConfigurationError, RedisAdapterError):
     """Raised when Redis adapter is used without an available client."""
 
 
-class RedisConnectionError(RedisAdapterError):
+class RedisConnectionError(DataConnectionError, RedisAdapterError):
     """Raised when a Redis operation cannot reach or use the backend."""
 
 
@@ -136,12 +139,12 @@ class RedisDataAdapter:
 
     def publish(self, stream: str, message: Mapping[str, Any]) -> WriteResult:
         try:
-            self._client_instance().xadd(self._stream_key(stream), _stream_fields(message))
+            message_id = self._client_instance().xadd(self._stream_key(stream), _stream_fields(message))
         except (RedisClientMissingError, RedisConfigError):
             raise
         except Exception as exc:
             raise RedisConnectionError(self._safe_error(exc)) from exc
-        return WriteResult(written=1, matched=1)
+        return WriteResult(written=1, matched=1, message_id=_text(message_id))
 
     def read(self, stream: str, cursor: str | None = None, limit: int = 100) -> StreamReadResult:
         if limit <= 0:
@@ -149,7 +152,13 @@ class RedisDataAdapter:
         stream_name = str(stream)
         stream_key = self._stream_key(stream_name)
         try:
-            response = self._client_instance().xread({stream_key: cursor or "0-0"}, count=max(0, int(limit)))
+            self._ensure_group(stream_key)
+            response = self._client_instance().xreadgroup(
+                self.stream_group(),
+                self.consumer_name(),
+                {stream_key: cursor or ">"},
+                count=max(0, int(limit)),
+            )
         except (RedisClientMissingError, RedisConfigError):
             raise
         except Exception as exc:
@@ -164,7 +173,7 @@ class RedisDataAdapter:
                     {
                         "stream": stream_name,
                         "id": normalized_id,
-                        "fields": _read_fields(fields),
+                        **_decode_envelope(fields),
                     }
                 )
                 next_cursor = normalized_id
@@ -200,11 +209,13 @@ class RedisDataAdapter:
     def health(self) -> HealthResult:
         try:
             ping = bool(self._client_instance().ping())
+        except DataConfigurationError as exc:
+            return HealthResult(status="failed", code="configuration_error", message=str(exc))
         except Exception as exc:
-            return HealthResult(status="failed", message=self._safe_error(exc))
+            return HealthResult(status="failed", code="connection_failed", message=self._safe_error(exc))
         if not ping:
-            return HealthResult(status="failed", message="Redis ping failed")
-        return HealthResult(status="ok", message="Redis connection is available")
+            return HealthResult(status="failed", code="connection_failed", message="Redis ping failed")
+        return HealthResult(status="ok", code="ok", message="Redis connection is available")
 
     def close(self) -> None:
         if self._client is _CLIENT_UNSET:
@@ -226,6 +237,22 @@ class RedisDataAdapter:
         if not group:
             raise RedisConfigError("Redis stream_group must not be empty")
         return group
+
+    def consumer_name(self) -> str:
+        consumer = str(self.config.options.get("consumer", "muscles-worker"))
+        if not consumer:
+            raise RedisConfigError("Redis consumer must not be empty")
+        return consumer
+
+    def _ensure_group(self, stream_key: str) -> None:
+        create = getattr(self._client_instance(), "xgroup_create", None)
+        if not callable(create):
+            raise RedisConfigError("Redis client does not support consumer groups")
+        try:
+            create(stream_key, self.stream_group(), id="0-0", mkstream=True)
+        except Exception as exc:
+            if "busygroup" not in str(exc).lower() and "already exists" not in str(exc).lower():
+                raise RedisConnectionError(self._safe_error(exc)) from exc
 
     def _key(self, key: str) -> str:
         normalized = _name(key, "Redis key")
@@ -258,15 +285,18 @@ class RedisDataAdapter:
         if unknown:
             names = ", ".join(unknown)
             raise RedisConfigError(f"Unsupported Redis resource options: {names}")
-        if "url" not in self.config.options or not self.config.options["url"]:
-            raise RedisConfigError("Redis resource requires url")
+        if not self.config.options.get("url") and not self.config.options.get("url_env"):
+            raise RedisConfigError("Redis resource requires url_env")
         for option in ("timeout", "socket_timeout", "socket_connect_timeout"):
             if option in self.config.options and float(self.config.options[option]) <= 0:
                 raise RedisConfigError(f"Redis {option} must be positive")
 
     def _safe_error(self, exc: Exception) -> str:
         message = str(exc)
-        url = str(self.config.options.get("url", ""))
+        try:
+            url = str(self.config.resolved_options().get("url", ""))
+        except DataConfigurationError:
+            url = str(self.config.options.get("url", ""))
         sensitive_values = {url}
         try:
             parsed = urlsplit(url)
@@ -313,17 +343,17 @@ def _default_redis_client(config: DataResourceConfig):
     if from_url is None:
         raise RedisClientMissingError("redis package does not expose Redis.from_url")
 
-    kwargs: dict[str, Any] = {
-        "decode_responses": bool(config.options.get("decode_responses", False)),
-    }
-    timeout = config.options.get("timeout")
+    options = config.resolved_options()
+    kwargs: dict[str, Any] = {}
+    kwargs["decode_responses"] = bool(options.get("decode_responses", False))
+    timeout = options.get("timeout")
     if timeout is not None:
         kwargs["socket_timeout"] = float(timeout)
         kwargs["socket_connect_timeout"] = float(timeout)
     for option in ("socket_timeout", "socket_connect_timeout"):
-        if option in config.options:
-            kwargs[option] = float(config.options[option])
-    return from_url(str(config.options["url"]), **kwargs)
+        if option in options:
+            kwargs[option] = float(options[option])
+    return from_url(str(options["url"]), **kwargs)
 
 
 def _ttl_ms(value: float, label: str) -> int:
@@ -359,7 +389,10 @@ def _text(value: Any) -> str:
 
 
 def _stream_fields(message: Mapping[str, Any]) -> dict[str, Any]:
-    return {str(key): value for key, value in dict(message).items()}
+    return {
+        "_schema": "muscles.data.message.v1",
+        "_payload": json.dumps(dict(message), ensure_ascii=False, sort_keys=True),
+    }
 
 
 def _read_fields(fields: Mapping[Any, Any]) -> dict[str, Any]:
@@ -370,3 +403,17 @@ def _decode_stream_value(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.decode("utf-8")
     return value
+
+
+def _decode_envelope(fields: Mapping[Any, Any]) -> dict[str, Any]:
+    normalized = _read_fields(fields)
+    try:
+        payload = json.loads(str(normalized.get("_payload", "{}")))
+    except (TypeError, ValueError) as exc:
+        raise RedisConnectionError("Redis stream message has invalid envelope payload") from exc
+    if not isinstance(payload, dict):
+        raise RedisConnectionError("Redis stream message envelope payload must be an object")
+    return {
+        "fields": payload,
+        "envelope": {"version": 1, "schema": normalized.get("_schema")},
+    }
