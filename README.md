@@ -49,15 +49,21 @@ data:
   resources:
     cache.redis:
       type: redis
-      url: ${REDIS_URL}
+      url_env: REDIS_URL
       namespace: app
       timeout: 3
       stream_group: workers
+      consumer: index-worker
 ```
 
 The adapter creates the Redis client lazily by key-value, lock, stream, explicit
 native access or `data.doctor` operations. Application code should use
 `KeyValuePort`, `LockPort` and `StreamPort`; direct client access is only an
 advanced escape hatch with `native_client: true`.
+
+Streams use `XADD`, `XREADGROUP` and `XACK`. The configured consumer group is
+created on first read and messages use the versioned
+`muscles.data.message.v1` envelope. Retry and dead-letter decisions stay with
+the application worker.
 
 See `muscular-example/example_data_redis_1` for an executable example.

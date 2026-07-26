@@ -20,6 +20,7 @@ class FakeRedisClient:
         self.deletes: list[tuple[str, ...]] = []
         self.streams: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         self.xacks: list[dict[str, Any]] = []
+        self.xgroups: list[dict[str, Any]] = []
         self.pings = 0
         self.closed = False
 
@@ -62,10 +63,17 @@ class FakeRedisClient:
             messages = [
                 (message_id, fields)
                 for message_id, fields in self.streams.get(name, [])
-                if cursor in {"0", "0-0"} or message_id > cursor
+                if cursor in {"0", "0-0", ">"} or message_id > cursor
             ]
             output.append((name, messages[:count]))
         return output
+
+    def xgroup_create(self, name: str, groupname: str, id: str = "0-0", mkstream: bool = False):
+        self.xgroups.append({"name": name, "groupname": groupname, "id": id, "mkstream": mkstream})
+
+    def xreadgroup(self, groupname: str, consumername: str, streams: dict[str, str], count: int | None = None, block: int | None = None):
+        del groupname, consumername, block
+        return self.xread(streams, count=count)
 
     def xack(self, name: str, groupname: str, *ids: str) -> int:
         self.xacks.append({"name": name, "groupname": groupname, "ids": ids})
@@ -128,8 +136,10 @@ def test_redis_external_adapter_maps_key_value_lock_stream_and_native_access():
     stream = runtime.require_port("cache.redis", StreamPort)
     assert stream.publish("events", {"kind": "created"}).written == 1
     read = stream.read("events", limit=10)
-    assert read.messages == [{"stream": "events", "id": "1-0", "fields": {"kind": "created"}}]
+    assert read.messages[0]["fields"] == {"kind": "created"}
+    assert read.messages[0]["envelope"]["version"] == 1
     assert stream.ack("events", "1-0").matched == 1
+    assert client.xgroups[0]["groupname"] == "workers"
 
     native = runtime.require_resource("cache.redis", DataCapability.NATIVE_CLIENT).native_client()
     assert native is client
@@ -153,10 +163,61 @@ def test_redis_external_adapter_reports_safe_failures():
         _runtime(bad_client).require_port("cache.redis", KeyValuePort).get("cursor")
 
     catalog = DataAdapterCatalog.with_defaults()
-    catalog.register(RedisDataFactory(client_factory=lambda _config: FakeRedisClient()))
+    catalog.register(RedisDataFactory(client_factory=lambda config: config.resolved_options()))
     unsupported = DataRuntime(
         config=DataConfig.from_raw({"data": {"resources": {"cache.redis": {"type": "redis", "url": "redis://localhost", "unsafe": True}}}}),
         catalog=catalog,
     )
     with pytest.raises(RedisConfigError, match="Unsupported Redis resource options"):
         unsupported.require_port("cache.redis", KeyValuePort).get("cursor")
+
+
+def test_redis_stream_uses_consumer_groups_and_resolves_url_env(monkeypatch):
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    client = FakeRedisClient()
+    captured: list[dict] = []
+    catalog = DataAdapterCatalog.with_defaults()
+    catalog.register(
+        RedisDataFactory(client_factory=lambda config: captured.append(config.resolved_options()) or client)
+    )
+    runtime = DataRuntime(
+        config=DataConfig.from_raw(
+            {
+                "data": {
+                    "resources": {
+                        "stream.redis": {
+                            "type": "redis",
+                            "url_env": "REDIS_URL",
+                            "namespace": "assetforge",
+                            "stream_group": "workers",
+                            "consumer": "worker-1",
+                        }
+                    }
+                }
+            }
+        ),
+        catalog=catalog,
+    )
+
+    stream = runtime.require_port("stream.redis", StreamPort)
+    stream.publish("index", {"job": "reindex"})
+    stream.read("index")
+
+    assert captured[0]["url"] == "redis://localhost:6379/0"
+    assert client.xgroups[0]["mkstream"] is True
+
+
+def test_redis_doctor_reports_configuration_error_for_missing_url_env():
+    catalog = DataAdapterCatalog.with_defaults()
+    catalog.register(RedisDataFactory(client_factory=lambda config: config.resolved_options()))
+    runtime = DataRuntime(
+        config=DataConfig.from_raw(
+            {"data": {"resources": {"stream.redis": {"type": "redis", "url_env": "MISSING_REDIS_URL"}}}}
+        ),
+        catalog=catalog,
+    )
+
+    doctor = runtime.doctor()
+    check = doctor["checks"][0]
+    assert check["status"] == "failed"
+    assert check["code"] == "configuration_error"
